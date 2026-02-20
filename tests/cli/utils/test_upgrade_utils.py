@@ -431,6 +431,37 @@ dependencies = ["some-dep>=1.0.0"]
 
         assert result is False
 
+    def test_preserves_dependencies_with_extras_brackets(
+        self, tmp_path: pathlib.Path
+    ) -> None:
+        """Test dependencies containing extras are replaced without corrupting TOML."""
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text(
+            """
+[project]
+name = "test-project"
+dependencies = [
+    "google-adk[bigquery-analytics]>=1.0.0",
+    "legacy-dep>=0.1.0",
+]
+
+[tool.agent-starter-pack]
+asp_version = "0.1.0"
+"""
+        )
+
+        result = write_merged_dependencies(
+            pyproject,
+            ["google-adk[bigquery-analytics]>=1.1.0", "new-dep>=2.0.0"],
+        )
+
+        assert result is True
+        content = pyproject.read_text()
+        assert '"google-adk[bigquery-analytics]>=1.1.0"' in content
+        assert '"new-dep>=2.0.0"' in content
+        assert "legacy-dep" not in content
+        assert "[tool.agent-starter-pack]" in content
+
 
 class TestCollectAllFilesDeepExclusion:
     """Tests for ** glob pattern exclusions in collect_all_files."""
