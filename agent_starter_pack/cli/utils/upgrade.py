@@ -475,26 +475,39 @@ def write_merged_dependencies(
         # Find the matching closing bracket while handling quoted strings,
         # including dependency extras like package[extra].
         in_string = False
+        quote_char = ""
         escape = False
-        for index in range(list_start, len(content)):
+        bracket_depth = 0
+        dep_end: int | None = None
+
+        for index in range(list_start, project_end):
             char = content[index]
             if in_string:
-                if escape:
+                if quote_char == '"' and escape:
                     escape = False
-                elif char == "\\":
+                elif quote_char == '"' and char == "\\":
                     escape = True
-                elif char == '"':
+                elif char == quote_char:
                     in_string = False
+                    quote_char = ""
                 continue
 
-            if char == '"':
+            if char in {'"', "'"}:
                 in_string = True
+                quote_char = char
+                continue
+
+            if char == "[":
+                bracket_depth += 1
                 continue
 
             if char == "]":
-                dep_end = index + 1
-                break
-        else:
+                bracket_depth -= 1
+                if bracket_depth == 0:
+                    dep_end = index + 1
+                    break
+
+        if dep_end is None:
             return False
 
         content = content[:dep_start] + new_deps_section + content[dep_end:]
