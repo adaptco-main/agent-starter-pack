@@ -9,6 +9,7 @@ The Agent Starter Pack provides a command-line interface (CLI) to create and set
 - [`enhance`](enhance.md) - Add agent-starter-pack capabilities to existing projects without creating a new directory
 - [`extract`](extract.md) - Extract a minimal, shareable agent core from a full project scaffold
 - [`list`](list.md) - List available agents and templates
+- [`generate-skill`](generate_skill.md) - Generate deterministic skill documentation from an existing project
 - [`register-gemini-enterprise`](register_gemini_enterprise.md) - Register a deployed Agent Engine to Gemini Enterprise
 
 For detailed usage instructions, click on the command links above.
