@@ -87,6 +87,8 @@ def detect_language(project_dir: pathlib.Path) -> str:
         except Exception:
             pass
 
+    # Order matters: check for more specific language files (e.g., go.mod) before
+    # more generic ones (e.g., pyproject.toml) to avoid false positives.
     for lang in ["go", "python"]:
         config = LANGUAGE_CONFIGS.get(lang)
         if not config:
