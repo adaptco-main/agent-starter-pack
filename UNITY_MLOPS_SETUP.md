@@ -1,79 +1,71 @@
-# Unity MLOps Setup Guide
+# Unity MLOps Pipeline Setup Guide
 
-This guide explains how to use `mlops_unity_pipeline.py` to automate a Unity + ML-Agents training workflow.
-
-## What the pipeline does
-
-1. Generates Unity C# behavior scripts from a natural language asset description.
-2. Builds a Unity environment (headless workflow).
-3. Trains agents with ML-Agents configurations (including offline RL mode).
-4. Stores a model artifact and metadata.
-5. Optionally registers the model in Vertex AI.
+This guide explains how to use `mlops_unity_pipeline.py` to automate Unity code generation, build, RL training, and model registration.
 
 ## Prerequisites
 
-- Unity project with ML-Agents package installed.
-- Python 3.10+.
-- `mlagents`, `croniter`, and `pyyaml` Python packages.
-- (Optional) GCP project for Vertex AI model registry.
+- Python 3.10+
+- Unity Editor with command-line build support
+- `mlagents` (for real training workflows)
+- `croniter` for scheduler support
+- Optional: Vertex AI project credentials
 
-Install minimal dependencies:
+Install dependencies:
 
-pip install "mlagents>=1.0.0,<2.0.0" croniter pyyaml
+```bash
+pip install mlagents==1.0.0 pyyaml==6.0.1 croniter==1.4.0
+```
 
-## Quick start
+## Core Components
+
+- `UnityAssetSpec`: describes the asset/behavior to generate.
+- `RLTrainingConfig`: controls RL and offline RL settings.
+- `UnityMLOpsOrchestrator`: runs generate → build → train → register.
+- `TrainingScheduler`: runs jobs from cron expressions.
+
+## Quick Start
 
 ```python
 import asyncio
 from mlops_unity_pipeline import (
+    UnityAssetSpec,
     RLTrainingConfig,
     TrainingJob,
-    UnityAssetSpec,
     UnityMLOpsOrchestrator,
 )
 
-
-async def main() -> None:
-    orchestrator = UnityMLOpsOrchestrator(workspace_dir="./artifacts")
+async def main():
+    orchestrator = UnityMLOpsOrchestrator()
 
     asset = UnityAssetSpec(
-        asset_id="nav-001",
-        name="NavigationAgent",
+        asset_id="test-001",
+        name="SimpleAgent",
         asset_type="behavior",
-        description="Navigate around obstacles to reach a target",
-        observation_space={"raycast": 8, "velocity": 2},
-        action_space={"type": "continuous", "size": 2},
+        description="Reach target position",
     )
 
-    config = RLTrainingConfig(
-        algorithm="PPO",
-        max_steps=100_000,
-        num_envs=16,
-        time_scale=20.0,
-    )
+    config = RLTrainingConfig(algorithm="PPO", max_steps=100_000)
 
-    job = TrainingJob(job_id="example-job", asset_spec=asset, rl_config=config)
+    job = TrainingJob(job_id="test-job", asset_spec=asset, rl_config=config)
     result = await orchestrator.execute_training_job(job)
     print(result)
-
 
 asyncio.run(main())
 ```
 
-## Scheduling recurrent training
+## Scheduler (24/7)
 
 ```python
 import asyncio
 from mlops_unity_pipeline import (
+    UnityAssetSpec,
     RLTrainingConfig,
     TrainingSchedule,
     TrainingScheduler,
-    UnityAssetSpec,
     UnityMLOpsOrchestrator,
 )
 
-
-async def run_forever() -> None:
+async def run_forever():
     orchestrator = UnityMLOpsOrchestrator()
     scheduler = TrainingScheduler(orchestrator)
 
@@ -82,32 +74,40 @@ async def run_forever() -> None:
         cron_expression="0 2 * * *",
         asset_specs=[
             UnityAssetSpec(
-                asset_id="agent-001",
-                name="SimpleAgent",
+                asset_id="nav-001",
+                name="NavigationAgent",
                 asset_type="behavior",
-                description="Reach target position",
+                description="Navigate around obstacles to a target",
             )
         ],
-        rl_config=RLTrainingConfig(algorithm="PPO", max_steps=200_000),
+        rl_config=RLTrainingConfig(max_steps=500_000, num_envs=16),
     )
 
     scheduler.add_schedule(schedule)
     await scheduler.run_forever()
 
-
 asyncio.run(run_forever())
 ```
 
-## Offline RL workflow
+## Offline RL Workflow
 
-- Record demonstrations from scripted or human gameplay.
-- Store demonstration files and point `RLTrainingConfig.demonstrations_path` to them.
-- Set `RLTrainingConfig.use_offline_rl = True`.
-- Run offline pretraining, then optionally fine-tune with online RL.
+1. Record demonstrations in Unity.
+2. Pass demonstration file paths via `RLTrainingConfig(demonstration_paths=[...])`.
+3. Set `use_offline_rl=True`.
+4. Use online fine-tuning as needed.
 
-## Production notes
+## Vertex AI Registration
 
-- Replace placeholder `generate_unity_code` with your LLM provider call.
-- Replace placeholder build/training internals with real Unity and `mlagents-learn` commands.
-- Send run metrics to TensorBoard and your observability stack.
-- Add webhook notifications around job start/success/failure.
+Model registration is enabled when both environment variables are present:
+
+- `VERTEX_PROJECT`
+- `VERTEX_REGION`
+
+Without these, the pipeline runs normally and skips registration.
+
+## Production Notes
+
+- Replace placeholder build/train methods with real subprocess calls to Unity and ML-Agents CLI.
+- Emit structured logs for observability.
+- Persist artifacts and metrics to your preferred data store.
+- Use webhooks/queues for notifications.

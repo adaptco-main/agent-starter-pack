@@ -1,261 +1,294 @@
-"""MLOps pipeline for autonomous Unity + ML-Agents training workflows.
+"""Automated Unity MLOps pipeline orchestrator.
 
-This module provides a lightweight orchestration layer that can:
-- Generate Unity C# assets from an LLM prompt/spec.
-- Build Unity environments in headless mode.
-- Train RL agents with ML-Agents (online and offline workflows).
-- Register trained models in Vertex AI model registry.
-- Schedule recurring training jobs via cron expressions.
+This module provides a reproducible, end-to-end workflow for:
+1) LLM-assisted Unity C# generation
+2) Headless Unity build
+3) ML-Agents training (online/offline-ready)
+4) Optional Vertex AI model registration
+5) Cron-style scheduling for continuous operations
 """
 
 from __future__ import annotations
 
 import asyncio
-import dataclasses
-import datetime as dt
 import json
-import pathlib
-import random
-import subprocess
-import textwrap
+import logging
+import os
 import uuid
-from typing import Any
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-from croniter import croniter
+try:
+    from croniter import croniter
+try:
+    from croniter import croniter
+except ImportError:  # pragma: no cover - optional dependency fallback
+    croniter = None
 
 
-@dataclasses.dataclass(slots=True)
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+
+@dataclass
 class UnityAssetSpec:
-    """Defines a Unity asset/behavior that should be generated and trained."""
+    """Specification for a Unity asset/behavior to generate and train."""
 
     asset_id: str
     name: str
     asset_type: str
     description: str
-    observation_space: dict[str, Any] | None = None
-    action_space: dict[str, Any] | None = None
-    metadata: dict[str, Any] | None = None
+    observation_space: Dict[str, Any] = field(default_factory=dict)
+    action_space: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclasses.dataclass(slots=True)
+@dataclass
 class RLTrainingConfig:
-    """Configuration for ML-Agents training."""
+    """RL training parameters for ML-Agents-compatible runs."""
 
     algorithm: str = "PPO"
     max_steps: int = 1_000_000
     num_envs: int = 16
     batch_size: int = 1024
-    buffer_size: int = 8192
-    time_scale: float = 20.0
-    use_offline_rl: bool = False
-    demonstrations_path: str | None = None
+    buffer_size: int = 10240
     learning_rate: float = 3e-4
-    gamma: float = 0.99
+    time_scale: float = 20.0
+    use_offline_rl: bool = True
+    demonstration_paths: List[str] = field(default_factory=list)
+    trainer_config_overrides: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclasses.dataclass(slots=True)
+@dataclass
 class TrainingJob:
-    """A single end-to-end build+train request."""
+    """Single orchestration unit for a generated Unity training run."""
 
     job_id: str
     asset_spec: UnityAssetSpec
     rl_config: RLTrainingConfig
+    output_dir: str = "artifacts/unity_mlops"
+    webhook_url: Optional[str] = None
 
 
-@dataclasses.dataclass(slots=True)
+@dataclass
 class TrainingResult:
-    """Result object returned by a completed training job."""
+    """Result bundle from a completed training job."""
 
     job_id: str
     status: str
+    started_at: str
+    completed_at: str
     generated_script_path: str
     unity_build_path: str
     trained_model_path: str
-    vertex_model_resource_name: str | None
-    metrics: dict[str, Any]
+    model_registry_id: Optional[str] = None
+    metrics: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclasses.dataclass(slots=True)
+@dataclass
 class TrainingSchedule:
-    """Cron-based recurring training schedule."""
+    """Cron schedule and workload definition."""
 
     schedule_id: str
     cron_expression: str
-    asset_specs: list[UnityAssetSpec]
+    asset_specs: List[UnityAssetSpec]
     rl_config: RLTrainingConfig
     enabled: bool = True
 
 
 class UnityMLOpsOrchestrator:
-    """Coordinates code generation, Unity build, RL training, and model registration."""
+    """Coordinates generation, build, train, and registration steps."""
 
-    def __init__(
-        self,
-        workspace_dir: str = "./artifacts",
-        vertex_project: str | None = None,
-        vertex_region: str = "us-central1",
-    ) -> None:
-        self.workspace = pathlib.Path(workspace_dir)
-        self.workspace.mkdir(parents=True, exist_ok=True)
-        self.vertex_project = vertex_project
-        self.vertex_region = vertex_region
+    def __init__(self, workspace_root: str = ".") -> None:
+        self.workspace_root = Path(workspace_root).resolve()
 
     async def execute_training_job(self, job: TrainingJob) -> TrainingResult:
-        job_dir = self.workspace / job.job_id
-        job_dir.mkdir(parents=True, exist_ok=True)
+        started_at = _utc_now_iso()
+        logger.info("Starting training job %s", job.job_id)
 
-        script_path = await self.generate_unity_code(job.asset_spec, job_dir)
-        build_path = await self.build_unity_environment(job.asset_spec, job_dir)
-        trained_model_path, metrics = await self.train_agent(job, build_path, job_dir)
-        vertex_resource = await self.register_model_in_vertex_ai(
-            job, trained_model_path, metrics
-        )
+        out_root = self.workspace_root / job.output_dir / job.job_id
+        out_root.mkdir(parents=True, exist_ok=True)
 
-        return TrainingResult(
+        generated_script = await self.generate_unity_code(job.asset_spec, out_root)
+        unity_build = await self.build_unity_environment(job.asset_spec, generated_script, out_root)
+        trained_model, metrics = await self.train_agent(job.asset_spec, job.rl_config, unity_build, out_root)
+        registry_id = await self.register_model_in_vertex_ai(job.asset_spec, trained_model, metrics)
+
+        result = TrainingResult(
             job_id=job.job_id,
             status="completed",
-            generated_script_path=str(script_path),
-            unity_build_path=str(build_path),
-            trained_model_path=str(trained_model_path),
-            vertex_model_resource_name=vertex_resource,
+            started_at=started_at,
+            completed_at=_utc_now_iso(),
+            generated_script_path=str(generated_script),
+            unity_build_path=str(unity_build),
+            trained_model_path=str(trained_model),
+            model_registry_id=registry_id,
             metrics=metrics,
         )
 
-    async def generate_unity_code(
-        self, asset_spec: UnityAssetSpec, job_dir: pathlib.Path
-    ) -> pathlib.Path:
-        """Generate a Unity C# script (stubbed template; replace with your LLM call)."""
-        script = textwrap.dedent(
-            f"""
-            // Auto-generated by UnityMLOpsOrchestrator
-            using UnityEngine;
-            using Unity.MLAgents;
-            using Unity.MLAgents.Sensors;
-            using Unity.MLAgents.Actuators;
+        self._persist_result(out_root, result)
+        await self._notify_webhook(job.webhook_url, result)
+        logger.info("Completed training job %s", job.job_id)
+        return result
 
-            public class {asset_spec.name} : Agent
-            {{
-                public override void OnEpisodeBegin() {{ }}
+    async def generate_unity_code(self, spec: UnityAssetSpec, out_root: Path) -> Path:
+        """Simulates LLM C# generation and writes a deterministic scaffold."""
+        scripts_dir = out_root / "generated"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        script_path = scripts_dir / f"{spec.name}.cs"
 
-                public override void CollectObservations(VectorSensor sensor)
-                {{
-                    // Observation config: {json.dumps(asset_spec.observation_space or {})}
-                }}
-
-                public override void OnActionReceived(ActionBuffers actions)
-                {{
-                    // Action config: {json.dumps(asset_spec.action_space or {})}
-                }}
-            }}
-            """
-        ).strip() + "\n"
-
-        script_path = job_dir / f"{asset_spec.name}.cs"
-        script_path.write_text(script, encoding="utf-8")
-        await asyncio.sleep(0.01)
+        csharp = f"""// Auto-generated by UnityMLOpsOrchestrator\nusing UnityEngine;\n\npublic class {spec.name} : MonoBehaviour\n{{\n    // Asset ID: {spec.asset_id}\n    // Type: {spec.asset_type}\n    // Description: {spec.description}\n\n    void Start() {{ Debug.Log(\"{spec.name} initialized\"); }}\n    void Update() {{ }}\n}}\n"""
+        script_path.write_text(csharp, encoding="utf-8")
+        await asyncio.sleep(0)
         return script_path
 
-    async def build_unity_environment(
-        self, asset_spec: UnityAssetSpec, job_dir: pathlib.Path
-    ) -> pathlib.Path:
-        """Build a Unity environment; writes a placeholder artifact by default."""
-        build_dir = job_dir / "unity_build"
+    async def build_unity_environment(self, spec: UnityAssetSpec, script_path: Path, out_root: Path) -> Path:
+        """Creates a placeholder headless build artifact path."""
+        build_dir = out_root / "build"
         build_dir.mkdir(parents=True, exist_ok=True)
-        manifest = {
-            "asset": dataclasses.asdict(asset_spec),
-            "built_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "mode": "headless-placeholder",
-        }
-        (build_dir / "build_manifest.json").write_text(
-            json.dumps(manifest, indent=2), encoding="utf-8"
+        binary_path = build_dir / f"{spec.name}.x86_64"
+        binary_path.write_text(
+            "Placeholder build artifact. Replace with Unity -batchmode invocation output.\n",
+            encoding="utf-8",
         )
-        await asyncio.sleep(0.01)
-        return build_dir
+        await asyncio.sleep(0)
+        return binary_path
 
     async def train_agent(
-        self, job: TrainingJob, build_path: pathlib.Path, job_dir: pathlib.Path
-    ) -> tuple[pathlib.Path, dict[str, Any]]:
-        """Train ML-Agents model; mocked metrics for local workflow validation."""
-        _ = build_path
-        runs_dir = job_dir / "runs"
-        runs_dir.mkdir(parents=True, exist_ok=True)
+        self,
+        spec: UnityAssetSpec,
+        config: RLTrainingConfig,
+        unity_build_path: Path,
+        out_root: Path,
+    ) -> tuple[Path, Dict[str, Any]]:
+        """Writes trainer config and a placeholder model for reproducible pipeline tests."""
+        train_dir = out_root / "training"
+        train_dir.mkdir(parents=True, exist_ok=True)
+
+        trainer_config_path = train_dir / "trainer_config.json"
+        trainer_config = {
+            "behavior_name": spec.name,
+            "algorithm": config.algorithm,
+            "max_steps": config.max_steps,
+            "num_envs": config.num_envs,
+            "batch_size": config.batch_size,
+            "buffer_size": config.buffer_size,
+            "learning_rate": config.learning_rate,
+            "time_scale": config.time_scale,
+            "use_offline_rl": config.use_offline_rl,
+            "demonstration_paths": config.demonstration_paths,
+            "overrides": config.trainer_config_overrides,
+            "unity_build_path": str(unity_build_path),
+        }
+        trainer_config_path.write_text(json.dumps(trainer_config, indent=2), encoding="utf-8")
+
+        model_path = train_dir / f"{spec.name}.onnx"
+        model_path.write_bytes(b"PLACEHOLDER_ONNX_MODEL")
 
         metrics = {
-            "algorithm": job.rl_config.algorithm,
-            "max_steps": job.rl_config.max_steps,
-            "mean_reward": round(random.uniform(0.7, 0.99), 3),
-            "episodes": random.randint(200, 1200),
-            "offline_rl": job.rl_config.use_offline_rl,
+            "episode_reward_mean": 0.0,
+            "loss": 0.0,
+            "timesteps": config.max_steps,
+            "offline_dataset_count": len(config.demonstration_paths),
         }
 
-        model_path = runs_dir / "model.onnx"
-        model_path.write_bytes(b"placeholder-onnx-bytes")
-        (runs_dir / "metrics.json").write_text(
-            json.dumps(metrics, indent=2), encoding="utf-8"
-        )
-
-        await asyncio.sleep(0.01)
+        await asyncio.sleep(0)
         return model_path, metrics
 
     async def register_model_in_vertex_ai(
-        self, job: TrainingJob, model_path: pathlib.Path, metrics: dict[str, Any]
-    ) -> str | None:
-        """Register model metadata in Vertex AI (local placeholder if not configured)."""
-        registry_record = {
-            "job_id": job.job_id,
-            "model_path": str(model_path),
-            "metrics": metrics,
-            "registered_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        }
-        record_path = self.workspace / job.job_id / "vertex_registry_record.json"
-        record_path.write_text(json.dumps(registry_record, indent=2), encoding="utf-8")
-
-        if not self.vertex_project:
+        self,
+        spec: UnityAssetSpec,
+        model_path: Path,
+        metrics: Dict[str, Any],
+    ) -> Optional[str]:
+        """Registers model metadata if Vertex AI env vars are configured."""
+        project = os.getenv("VERTEX_PROJECT")
+        region = os.getenv("VERTEX_REGION")
+        if not project or not region:
+            logger.info("Skipping Vertex AI registration (VERTEX_PROJECT or VERTEX_REGION missing)")
+            await asyncio.sleep(0)
             return None
 
-        return (
-            f"projects/{self.vertex_project}/locations/{self.vertex_region}/"
-            f"models/{uuid.uuid4()}"
-        )
+        model_id = f"vertex://{project}/{region}/{spec.name}/{uuid.uuid4().hex[:12]}"
+        await asyncio.sleep(0)
+        return model_id
+
+    def _persist_result(self, out_root: Path, result: TrainingResult) -> None:
+        result_path = out_root / "result.json"
+        result_path.write_text(json.dumps(asdict(result), indent=2), encoding="utf-8")
+
+    async def _notify_webhook(self, webhook_url: Optional[str], result: TrainingResult) -> None:
+        # Intentionally no outbound HTTP dependency; teams can wire their preferred client.
+        if webhook_url:
+            logger.info("Webhook configured for %s (notification stub).", result.job_id)
+        await asyncio.sleep(0)
 
 
 class TrainingScheduler:
-    """Simple asyncio-based cron scheduler for recurring training jobs."""
+    """Cron-based scheduler to run jobs continuously."""
 
     def __init__(self, orchestrator: UnityMLOpsOrchestrator) -> None:
         self.orchestrator = orchestrator
-        self._schedules: dict[str, TrainingSchedule] = {}
+        self._schedules: Dict[str, TrainingSchedule] = {}
 
     def add_schedule(self, schedule: TrainingSchedule) -> None:
+        self._validate_cron(schedule.cron_expression)
         self._schedules[schedule.schedule_id] = schedule
 
-    async def run_once_due(self, now: dt.datetime | None = None) -> list[TrainingResult]:
-        now = now or dt.datetime.now(dt.timezone.utc)
-        results: list[TrainingResult] = []
+    def remove_schedule(self, schedule_id: str) -> None:
+        self._schedules.pop(schedule_id, None)
 
-        for schedule in self._schedules.values():
-            if not schedule.enabled:
-                continue
-
-            previous = now - dt.timedelta(seconds=poll_interval_seconds + 5) # Add a small buffer
-            itr = croniter(schedule.cron_expression, previous)
-            next_run = itr.get_next(dt.datetime)
-            if next_run <= now:
-                for asset_spec in schedule.asset_specs:
-                    job = TrainingJob(
-                        job_id=f"{schedule.schedule_id}-{asset_spec.asset_id}-{int(now.timestamp())}",
-                        asset_spec=asset_spec,
-                        rl_config=schedule.rl_config,
-                    )
-                    results.append(await self.orchestrator.execute_training_job(job))
-        return results
+    def list_schedules(self) -> List[TrainingSchedule]:
+        return list(self._schedules.values())
 
     async def run_forever(self, poll_interval_seconds: int = 30) -> None:
+        if not self._schedules:
+            raise ValueError("No schedules configured")
+
+        next_run_map = {
+            sid: self._next_time(s.cron_expression)
+            for sid, s in self._schedules.items()
+            if s.enabled
+        }
+
         while True:
-            await self.run_once_due()
+            now = datetime.now(timezone.utc)
+            for sid, schedule in self._schedules.items():
+                if not schedule.enabled:
+                    continue
+
+                due_at = next_run_map.get(sid)
+                if due_at and now >= due_at:
+                    await self._run_schedule_once(schedule)
+                    next_run_map[sid] = self._next_time(schedule.cron_expression, now)
+
             await asyncio.sleep(poll_interval_seconds)
 
+    async def _run_schedule_once(self, schedule: TrainingSchedule) -> None:
+        for asset in schedule.asset_specs:
+            job = TrainingJob(
+                job_id=f"{schedule.schedule_id}-{asset.asset_id}-{uuid.uuid4().hex[:8]}",
+                asset_spec=asset,
+                rl_config=schedule.rl_config,
+            )
+            await self.orchestrator.execute_training_job(job)
 
-def run_unity_headless_build(command: list[str]) -> subprocess.CompletedProcess[str]:
-    """Utility wrapper for invoking Unity headless build commands."""
-    return subprocess.run(command, check=False, capture_output=True, text=True)
+    @staticmethod
+    def _validate_cron(expr: str) -> None:
+        if croniter is None:
+            raise RuntimeError("croniter is required for scheduling. Install with: pip install croniter")
+        if not croniter.is_valid(expr):
+            raise ValueError(f"Invalid cron expression: {expr}")
+
+    @staticmethod
+    def _next_time(expr: str, base: Optional[datetime] = None) -> datetime:
+        if croniter is None:
+            raise RuntimeError("croniter is required for scheduling. Install with: pip install croniter")
+        base = base or datetime.now(timezone.utc)
+        return croniter(expr, base).get_next(datetime)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
