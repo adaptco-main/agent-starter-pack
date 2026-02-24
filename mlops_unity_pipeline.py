@@ -237,7 +237,7 @@ class TrainingScheduler:
             if not schedule.enabled:
                 continue
 
-            previous = now - dt.timedelta(minutes=1)
+            previous = now - dt.timedelta(seconds=poll_interval_seconds + 5) # Add a small buffer
             itr = croniter(schedule.cron_expression, previous)
             next_run = itr.get_next(dt.datetime)
             if next_run <= now:
